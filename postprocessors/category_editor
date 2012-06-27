@@ -1,0 +1,992 @@
+#!/usr/bin/perl -w
+
+#
+# Edit the category list down to something shorter so can use categories
+# to select programs to record.  100 distinct categories are too many.
+# About 20 is ok, less would be better.
+#
+# If the program is a movie, and we don't have movie as the first category
+# they make it so.
+#
+# MythTV seems to only use the first category unless the category is of the set:
+#	/(serie|movie|filme?|show|sport)s?$/i
+# not all of which are currently handled by this script.
+#
+# Some references that were useful:
+#	http://mythtv.org/pipermail/mythtv-dev/2007-April/054474.html
+#	http://xbmc.org/forum/archive/index.php/t-50712.html
+#	http://web.aanet.com.au/~auric/?q=node/15
+#
+#
+# Coptright 2009, Scott Merrilees, Tue Dec 22 22:44:48 EST 2009
+#
+# Derived from autgment_timezone from shepherd source, by removing all but
+# skeleton & then fleshing it out into category_editor, and then rewriting most
+# of the remainder.
+#
+
+use strict;
+my $prog = "category_editor";
+my $version = "0.26";
+
+use XMLTV;
+use Getopt::Long;
+use IO::File;
+use IO::String;
+use Data::Dumper;
+
+# Variables referenced by the programme callback sub have scope problems if
+# the sub is 'required' for debugging, so make CE a global that can be
+# referenced from a 'required' file.
+
+use vars qw(%CE);					# make global
+
+$CE{stats}			= {};
+$CE{output}			= "output.xmltv";
+$CE{output_default}		= $CE{output};
+$CE{limit}			= 0;
+
+GetOptions(
+	'desc'			=> \$CE{desc},
+	'output=s'		=> \$CE{output},
+	'ready'			=> \$CE{ready},
+	'rules=s'		=> \$CE{rules},	# user rules file
+	'version'		=> \$CE{version},
+
+	'debug'			=> \$CE{debug},
+	'verbose'		=> \$CE{debug},
+	'v'			=> \$CE{debug},
+	'limit=i'		=> \$CE{limit},	# limit debugging to first n records
+
+	'help'			=> \$CE{help},
+	'h'			=> \$CE{help},
+
+	'rdump'			=> \$CE{rdump},	# dump rules
+	'sdump'			=> \$CE{sdump},	# dump subroutine
+	'xdump'			=> \$CE{xdump},	# dump xmltv data
+
+	'srequire=s'		=> \$CE{srequire},	# require sdumped _programme_callback from file
+
+	'select=s'		=> \$CE{select},	# select selected rules
+							# see with sdump, rdump is too early
+
+	'region=i'		=> \$CE{ignored},	# ignored
+	'days=i'		=> \$CE{ignored},	# ignored
+	'channels_file=s'	=> \$CE{ignored},	# ignored
+
+	);
+
+# --limit implies --debug
+$CE{debug}++ if $CE{limit} > 0;
+
+if ($CE{debug}) {
+	$| = 1;	# disable output buffering to enable better issue localisation
+	print "DEBUG";
+	for my $k (sort keys %CE) {
+		print " $k=", defined($CE{$k}) ? $CE{$k} : "undef";
+	}
+	print "\n";
+}
+
+# Won't rdump a rules file, you should just look at it instead.
+if ($CE{rdump} && $CE{rules}) {
+	warn "$prog: --rdump invalid with --rules\n";
+	die help();
+}
+
+# disable output if indicated
+$CE{output} = "" if $CE{output} =~ m/^(none|null|\/dev\/null)$/i;
+
+# If dumping, disable output.
+$CE{output} = "" if $CE{rdump} || $CE{sdump} || $CE{xdump};
+
+die "$prog: rdump/sdump invalid with srequire\n"
+	if ($CE{rdump} || $CE{sdump}) && $CE{srequire};
+
+printexit(desc()) if $CE{desc};
+printexit(help()) if $CE{help};
+
+# print prog/version, useful in shepherd log, except when debugging/dumping
+print "$prog v$version\n" unless $CE{debug} || $CE{output} eq "";
+exit(0) if $CE{version};
+
+# if relax above rdump/rules check, need to move this code
+printexit(rules_table()) if $CE{rdump};
+
+# Generate rules from internal or external rules,
+# applying selectors as spectified.
+my $rules = rules_generate();
+die "$prog: rules not valid, so not ready\n" unless $rules;
+$rules = rules_before() . $rules . rules_after();
+if ($CE{sdump}) {
+	$rules =~ s/sub /sub _programme_callback/;
+	$rules .= "1;\n";
+	printexit($rules);
+}
+
+# Perl parse of rules.
+# Note: perl isn't giving much help on parse failure.
+my $programme_callback;
+if ($CE{srequire}) {
+	require "$CE{srequire}";
+	$programme_callback = \&_programme_callback;
+} else {
+	eval("\$programme_callback = " . $rules);
+	die "$prog: rules perl parse failed, so not ready, try --help then --rdump and/or --sdump\n"
+		unless $programme_callback;
+}
+
+# READY now, rules parse valid and perl parsing ok.
+printexit("$prog is ready for operation.\n") if $CE{ready};
+
+die "$prog: no input specified\n" if $#ARGV < 0;
+
+# Start XMLTV output stream.
+if ($CE{output} ne "") {
+
+	my $fh = new IO::File($CE{output}, "w") ||
+		die "$prog: can not create $CE{output}: $!\n";
+	$CE{writer} = new XMLTV::Writer( 'OUTPUT' => $fh,
+		'encoding' => 'ISO-8859-1' );
+	$CE{writer}->start( { 'source-info-name' => "$prog $version",
+		'generator-info-name' => "$prog $version"} );
+}
+
+# Parse each XMLTV input file.
+for my $file (@ARGV) {
+	print "Parsing: " . ($file eq "-" ?
+		"(from-stdin, hit control-D to finish)" : $file) . "\n";
+	XMLTV::parsefiles_callback(undef, undef, \&channel_callback,
+		$programme_callback, $file);
+}
+
+# Finish XMLTV output stream.
+$CE{writer}->end() if $CE{writer};
+
+print "Finished parsing, output in $CE{output}\n" if $CE{output};
+print "STATS categories=", scalar(keys %{$CE{stats}}) - 1;
+my $comma = "";
+foreach my $k (sort keys %{$CE{stats}}) {
+	print "$comma $k=$CE{stats}{$k}";
+	$comma = ",";
+}
+print "\n";
+
+exit(0);
+
+
+
+# Generate base rule set, from internal rules, or external rules file.
+# Apply selectors if specified.
+sub rules_generate
+{
+	# Parse rules file, generating rules to be pasted
+	# in between the before and after templates.
+	my $rr;
+	if ($CE{rules}) {
+		unless ($rr = new IO::File($CE{rules}, "r")) {
+			warn "$prog: can not open rules: $CE{rules}: $!\n";
+			return "";
+		}
+	} else {
+		$rr = new IO::String(rules_table());
+	}
+	my $rules = "";
+	my $valid = 1;
+	my $comment;
+	my @select = ();
+	@select = split(/,/, $CE{select}) if $CE{select};
+	while (<$rr>) {
+		chomp;
+		# Enable selected rules via selector comment.
+		if ($#select >= 0 && /^#[A-Z0-9#]+#/) {
+			for my $s (@select) {
+				s/^#([A-Z0-9]+#)*$s(#[A-Z0-9]+)*#\s*//;
+				last unless /^#/;
+			}
+		}
+		# Allow direct perl injection usnig syntax '^='.
+		# So strip = and inject code.
+		if (s/^=//) {
+			$rules .= "$_\n";
+			next;
+		}
+		
+		# Try to preserve comments, as will make --sdump easier to understand.
+		$comment = "";
+		$comment = $1 if s/(\s*#.*)//;	# strip but save comment
+		s/^\s+//;			# remove leading space
+		s/\s+$//;			# remove trailing space
+		if (/^$/) {	
+			$rules .= "$comment\n" if $comment; # comment only line
+			next;
+		}
+		s/\t+/\t/g;			# collapse multiple tabs
+		my @f = split(/\t/);
+		if ($#f < 0 || $#f > 2) {
+			warn "$prog: invalid rule=\"$_\"";
+			$valid = 0;
+			next;
+		}
+		$f[2] = 1 unless defined($f[2]);
+		$f[1] = 1 unless defined($f[1]);
+		$f[1] =~ s/^if\s*//;		# strip 'if ' if present
+		$f[1] =~ s/;$//;		# strip trailing ; if present
+		# $f[0] can be used directly because loop uses $_ as the category variable.
+		$rules .= "\t\tif ($f[1]) { if ($f[0]) { $f[2]; } }$comment\n";
+	}
+	$rr->close();
+
+	return $valid ? $rules : "";
+}
+
+
+
+sub channel_callback($)
+{
+	my $c = shift;
+	print "__CHANNEL " . Dumper($c) if $CE{xdump};
+	$CE{writer}->write_channel($c) if $CE{writer};
+}
+
+
+
+sub printexit
+{
+	print @_;
+	exit(0);
+}
+
+
+
+sub help
+{
+	return << 'EOD';
+
+usage: $prog [options] [file ...]
+
+Documented options:
+	--desc		Print description of $prog.
+	--output=file	Send final XMLTV output to file
+			(default: $CE{output_default})
+	--ready		Test if $prog ready for operation.
+			This will fail if rules are invalid.
+	--rules=file	Local rules file, converted into rules subroutine.
+	--version	Print version & terminate.
+
+	--help		Produce this help output.
+	--debug		Produce debugging outout.
+	--limit=n	Limit debugging to first n records.
+
+	--rdump		Dump internal default rules & terminate.
+			This can be used as the basis of a local rules file.
+	--sdump		Dump generated rules subroutine & terminate.
+	--xdump		Dump XMLTV input data & terminate.
+
+	--srequire=file	Load sdumped programme callback module
+			from file for debugging.
+
+	--select=SELECT	Select rules currently disabled with ^#KEY#.
+			Multiple selections using KEY1,KEY2 etc OK.
+
+Note: options can be permanently enabled in shepherd, see examples below:
+
+	shepherd --component-set category_editor:rules=/path/to/local.rules
+	shepherd --component-set category_editor:select=Z1,SALL
+
+How to test a ruleset to see the resulting category distribution, noting
+that some categories that appear will be secondary categories, and as such
+don't get loaded into the mythtv database:
+
+	args="--rules=/path/to/rules --output=none"
+	./category_editor $args
+
+or to see the actual category edits:
+
+	args="--rules=/path/to/rules --output=none"
+	./category_editor $args --debug /path/to/input > o
+	grep interesting-text o # since usually not interested in all the lines
+
+or to limit debug output to the first 10 category edits:
+
+	args="--rules=/path/to/rules --output=none"
+	./category_editor --limit=10 /path/to/input
+
+To debug a broken rule set the causes a perl parse failure,
+and get some real perl error messages, do the following
+after selecting the appropiate select options:
+
+	args="--output=none --select=Z1,S,SC --rules=/path/to/rules --debug"
+	./category_editor $args --sdump > s.pm
+	./category_editor $args --srequire=s.pm /path/to/input
+
+If you get a perl runtime error like "at (eval 16) line 299, <GEN2> line 188"
+then look at s.pm line 299.
+
+EOD
+}
+
+
+
+sub desc
+{
+	return << 'EOD';
+Edit XMLTV categories assigned to a programme according to rules.
+EOD
+}
+
+
+
+# Debugging hook, as difficult to set breakpoints in eval'd code.
+sub hook
+{
+	1;
+}
+
+
+
+#
+# Rules subroutine split into three parts below as seperate subroutines.
+# This allows forward reference, so don't have to place at beginning of program.
+#
+#BEFORE
+sub rules_before
+{
+	return << 'EOD';
+sub ($)
+{
+	use strict;	# for debugging with --srequire
+
+	my $p = shift;
+
+	hook "start\n";
+
+	# No easy way to abort processing after limit, however can skip rest.
+	$CE{stats}{_count}++;
+	if ($CE{limit} > 0) {
+		print "DEBUG limit=$CE{limit}\n"
+			if $CE{stats}{_count} == $CE{limit} + 1;
+		return if $CE{stats}{_count} > $CE{limit};
+	}
+
+	# preload shortcuts for use by rules table
+	my $title	= $p->{title}[0][0];
+	my $subtitle	= defined($p->{'sub-title'}[0]) ?
+				$p->{'sub-title'}[0][0] : "";
+	my $desc	= $p->{desc}[0];
+	(my $start_time	= $p->{start}) =~ s/.*(....)..$/$1/;
+	(my $stop_time	= $p->{stop})  =~ s/.*(....)..$/$1/;
+	my $length	= (defined($p->{length}) ? $p->{length} : 0) / 60;	# sec => min
+	(my $channel	= $p->{channel}) =~ s/\..*//; $channel = uc $channel;
+	my $category0	= defined($p->{category}[0]) ? $p->{category}[0][0] : "";
+	my $category1	= defined($p->{category}[1]) ? $p->{category}[1][0] : "";
+	my $url0	= defined($p->{url}[0]) ? $p->{url}[0] : "";
+
+	my $isMovie	= 0; $isMovie++ if ($category0 =~ m/^movie/i) or
+				($category1 =~ m/^movie/i) or
+				($url0 =~ m/imdb/i);
+	my $isSeries	= 0; # currently ignored, maybe ok when tvdb ok
+	my $isSports	= 0; $isSports++ if ($category0 eq "sports") or
+				($category1 eq "sports");
+	my $isTVShow	= 0; # currently ignored, maybe ok when tvdb ok
+
+	my $isPremiere	= 0;
+	my $isFinal	= 0;
+	my $isLive	= 0;
+
+	my $empty	= 0;
+
+	print "__PROGRAMME $CE{stats}{_count} " . Dumper($p) if $CE{xdump};
+
+	# ensure category is defined and has an 
+	# emptyish category so loop will at least iterate
+	# and we have a chance to do something, maybe on title
+	if ($category0 eq "") {
+		$empty = 1;
+		$p->{category} = [[ "", "en" ]];
+	}
+
+	# debug stage 0
+	print "DEBUG ", substr($p->{start}, 0, 8),
+		" $start_time $stop_time $length ms=$isMovie$isSports  $title "
+		if $CE{debug};
+
+	for my $c (@{$p->{category}})
+	{
+		$_ = ${$c}[0];			# use $_ as category
+		print " $_" if $CE{debug};	# debug stage 1
+### INSERT RULES BELOW HERE
+EOD
+
+}
+
+
+
+#TABLE
+sub rules_table
+{
+	return << 'EOD';
+# RULES TABLE
+#substitute/match-field			if-field			do-field
+#
+# Comments are introduced with #, as such they can't appear inside any
+# of the above fields else the field will be truncated.
+# Fields are seperated by TABS, spaces WILL NOT WORK.
+# The if-field can start with 'if ' for readability if desired.
+#
+# Unused preceeding fields should use 1 as a marker, as thus evaluates to true.
+# Unused trailing fields will be automatically replaced with 1.
+#
+# Each line in this table is turned into perl that looks something like:
+#
+# if (if-field) {
+#	if (substitute/match-field) {
+#		do-field;
+#	}
+# }
+#
+###
+#
+# Optional rule selections are specified by the pattern #[A-Z0-9]+#
+# anchored to the beginning of the line.
+# Multiple selctors can be encoded on the one line. See below.
+# When a selector is selected, the rest of the selectors are stripped from
+# the line, leaving the rule uncommented & thus enabled.
+#
+# Selectors fall into the following base classes:
+#	M*		Music selectors
+#	S*		Sport selectors
+#	NOCHANGE	Disable editing, to allow debug output analysis.
+#	MINCHANGE	As above, however strip Premiere, Final & Live first.
+#	MAPCHANGE	As above, however allow mapping first.
+#	PFLDEBUG	Enable debugging of Premiere/Final/Live flags.
+#	Z*		More extreme editting selectors.
+#
+# Note Z* selector z recategorisation forces uninteresting categories
+# to the end of the sorted category list so choosing programs to record
+# via category name in mythtv is quicker.
+#
+###
+#
+# The current category being processed is held in the perl variable $_,
+# which is the default variable for substitute & matches.
+#
+# The following copies of the XMLTV proramme entry are available for
+# read-only use:
+#
+#	$title
+#	$subtitle
+#	$desc
+#	$start_time		hhmm
+#	$stop_time		hhmm
+#	$length			minutes
+#	$channel		upper case
+#	$category0
+#	$category1
+#	$url0
+#
+# The following status variables are available to use:
+#
+#	$isMovie	# XMLTV or IMDB movie
+#	$isSeries	# currently ignored, maybe ok when tvdb ok
+#	$isSports	# Sports, seems to be set ok by the program guides
+#	$isTVShow	# currently ignored, maybe ok when tvdb ok
+#	$isPremiere	# moved to a category that is ignored by mythtv
+#	$isFinal	# moved to a category that is ignored by mythtv
+#	$isLive 	# moved to a category that is ignored by mythtv
+#
+
+# = code is straight perl code, after stripping the initial =.
+# The BEGIN block means it is only evaluated once,
+# even if it is in the middle of the main category parsing loop.
+
+= # Load up Category-Category map, mapCC, and Title-Cateogry map, mapTC.
+= # Do it with a begin so it only happens once, rather than once for each
+= # category we are parsing.  Can use #MAPCHANGE# to terminate rules after
+= # doing mapping rather than allowing the rest of the rules to also apply.
+= BEGIN {
+=	%{$CE{mapCC}} = (
+#S#SALL# =	"afl"				=>	"sport,afl",
+#S#SALL# =	"athletics"			=>	"sport,athletics",
+#L#LALL# =	"animals"			=>	"lifestyle,pets",
+=		"art"				=>	"arts",
+=		"arts and living"		=>	"arts",
+#L#LALL# =	"auto maintenance"		=>	"lifestyle,car",
+#L#LALL# =	"auto"				=>	"lifestyle,car",
+#S#SALL# =	"baseball"			=>	"sport,baseball",
+#S#SALL# =	"basketball"			=>	"sport,basketball",
+#S#SALL# =	"bicycling"			=>	"sport,bicycling",
+#S#SALL# =	"boating"			=>	"sport,boating",
+#S#SALL# =	"bowls"				=>	"sport,bowls",
+#S#SALL# =	"boxing"			=>	"sport,boxing",
+=		"classic"			=>	"drama",
+#M#MALL# =	"classical"			=>	"music,classical-opera",
+#M#MALL# =	"classical,opera"		=>	"music,classical-opera",
+#L#LALL# =	"collectibles"			=>	"lifestyle,hobby",
+#L#LALL# =	"computers"			=>	"lifestyle,computers",
+#L#LALL# =	"cooking"			=>	"lifestyle,cooking",
+#M#MALL# =	"country"			=>	"music,country",
+=		"courtroom"			=>	"reality,courtroom",
+#S#SALL# =	"cricket"			=>	"sport,cricket",
+#M#MALL# =	"dance"				=>	"music,dance",	# probably arts, but #MDA is easy
+=		"daytime"			=>	"variety",
+#S#SALL# =	"diving"			=>	"sport,swimming",
+=		"family"			=>	"children",
+#L#LALL# =	"fashion"			=>	"lifestyle,fashion",
+=		"film-noir"			=>	"movie",
+#S#SALL# =	"fishing"			=>	"sport,fishing",
+#L#LALL# =	"food"				=>	"lifestyle,food",
+#S#SALL# =	"football"			=>	"sport,football",
+#S#SALL# =	"football (soccer)"		=>	"sport,soccer",
+=		"game,reality"			=>	"reality,game",
+#L#LALL# =	"garden"			=>	"lifestyle,home",
+#L#LALL# =	"gardening"			=>	"lifestyle,home",
+#S#SALL# =	"golf"				=>	"sport,golf",
+=		"gossip"			=>	"celebrity",
+#S#SALL# =	"gymnastics"			=>	"sport,gymnastics",
+#L#LALL# =	"health and fitness"		=>	"lifestyle,health",
+#L#LALL# =	"self help"			=>	"lifestyle,health",
+=		"historical drama"		=>	"drama",
+#L#LALL# =	"holiday"			=>	"lifestyle,holiday",
+#L#LALL# =	"home and garden"		=>	"lifestyle,home",
+#S#SALL# =	"horse"				=>	"sport,horse",
+#L#LALL# =	"how to"			=>	"lifestyle",
+#L#LALL# =	"indigenous"			=>	"lifestyle,ingigenous",
+=		"international"			=>	"news",
+=		"interview"			=>	"celebrity",
+#M#MALL# =	"jazz,blues"			=>	"music,jazz-blues",
+#L#LALL# =	"leisure"			=>	"lifestyle,leisure",
+=		"light entertainment,arts"	=>	"celebrity",
+#M#MALL# =	"live,request"			=>	"music,request",
+=		"local news"			=>	"news",
+=		"magazine"			=>	"celebrity",
+#S#SALL# =	"martial arts"			=>	"sport,martial-arts",
+#L#LALL# =	"medical"			=>	"lifestyle,health",
+#S#SALL# =	"motor sport"			=>	"sport,motor-sport",
+#S#SALL# =	"motor sports"			=>	"sport,motor-sport",
+#S#SALL# =	"motorcycles"			=>	"sport,motor-sport",
+=		"n,a"				=>	"unknown",
+#S#SALL# =	"netball"			=>	"sport,netball",
+=		"not specified"			=>	"unknown",
+#S#SALL# =	"olympics"			=>	"sport,olympics",
+#M#MALL# =	"opera"				=>	"music,classical-opera",
+=		"other"				=>	"unknown",
+#L#LALL# =	"outdoors"			=>	"lifestyle,outdoors",
+=		"parliament"			=>	"reality,parliament",
+#S#SALL# =	"poker"				=>	"sport,poker",
+#M#MALL# =	"pop"				=>	"music,pop",
+#M#MALL# =	"rap,hip hop"			=>	"music,rap-hip hop",
+=		"reality-tv"			=>	"reality",
+#M#MALL# =	"rock"				=>	"music,rock",
+#S#SALL# =	"rugby league"			=>	"sport,league",
+#S#SALL# =	"rugby union"			=>	"sport,rugby",
+#S#SALL# =	"rally car racing"		=>	"sport,motor-sport",
+#S#SALL# =	"running"			=>	"sport,running",
+=		"satire"			=>	"comedy",
+=		"soap opera"			=>	"soap",
+#L#LALL# =	"science and health"		=>	"lifestyle,health",
+#S#SALL# =	"snow sports"			=>	"sport,snow",
+#S#SALL# =	"soccer"			=>	"sport,soccer",
+#S#SALL# =	"swimming"			=>	"sport,swimming",
+#S#SALL# =	"swimming and diving"		=>	"sport,swimming",
+=		"social issues"			=>	"arts",
+=		"specials"			=>	"entertainment",
+#S#SALL# =	"sports news"			=>	"sport,news",
+#S#SALL# =	"sports talk"			=>	"sport,talk",
+=		"station close"			=>	"unknown",
+=		"suspense"			=>	"drama",
+#S#SALL# =	"tennis"			=>	"sport,tennis",
+=		"technology"			=>	"science",
+#S#SALL# =	"touring car racing"		=>	"sport,motor-sport",
+=		"thriller"			=>	"drama",
+#S#SALL# =	"track and field"		=>	"sport,athletics",
+=		"transmission"			=>	"unknown",
+#S#SALL# =	"volleyball"			=>	"sport,volleyball",
+#S#SALL# =	"water sports"			=>	"sport,water",
+=		"western"			=>	"drama",
+=		"westerns"			=>	"drama",
+#S#SALL# =	"wrestling"			=>	"sport,wrestling",
+=	),
+=
+=	# category "entertainment" is far too broard, while others are far too narrow
+=	%{$CE{mapTC}} = (
+=		"BTN Daily"			=>	"news",
+=		"Beach Patrol"			=>	"reality",
+=		"Entertainment Tonight"		=>	"celebrity",
+=		"Four Corners"			=>	"current affairs",
+=		"Global Village"		=>	"news",
+=		"Good News Week"		=>	"comedy",
+=		"Medium"			=>	"crime",
+=		"Midsommer Murders"		=>	"crime",
+=		"Rebus"				=>	"crime",
+=		"Property Ladder"		=>	"reality",
+=		"Seven Dwarves"			=>	"comedy",
+=		"Taggart"			=>	"crime",
+=		"The City"			=>	"reality",
+=		"The Mentalist"			=>	"crime",
+=		"The Family UK"			=>	"reality",
+=		"TMZ"				=>	"celebrity",
+=		"Totally Wild"			=>	"children",
+=		"Young Soldiers"		=>	"reality",
+=	);
+= }
+
+# RULES START
+# Convert to lower case, makes parsing easier & more consistant.
+1					1				$_ = lc $_
+
+# Sometimes you just what to see what you get by default.
+#NOCHANGE# next			# terminate rules here if selected
+
+# May be recategorising mythconverg here also, so leave these alone.
+m/^(movie|sports|series|tvshow)$/i	if $_ eq $category1		next
+
+# Replace / in category with , so it is easier to write substitute rules.
+s/\//,/g
+
+s/^premiere\s+//			1				$isPremiere++
+s/^final\s+//				1				$isFinal++
+s/^live\s+//				1				$isLive++
+
+#PFLDEBUG# 1				if $CE{debug}			print " $isPremiere$isFinal$isLive "
+
+# Like NOCHANGE, but allow strip Premiere Final Live from categories as above.
+#MINCHANGE# next		# terminate rules here if selected
+
+# Normalise dodgy imdb categories, and do before map so can remap.
+s/imdb //
+s/ section//
+
+# Map category via direct mapping table for title or category.
+# If want to stop here, use "next" as 3rd field.
+s/.*/$CE{mapTC}{$title}/		if $CE{mapTC}{$title}
+s/.*/$CE{mapCC}{$_}/			if $CE{mapCC}{$_}
+
+# Like MINCHANGE, but allow mapping.
+#MAPCHANGE# next		# terminate rules here if selected
+
+# Strip group
+s/^(.*)group$/$1/
+
+# Strip trailing whitespace/punctuation
+s/[\s.,-]+$//
+
+# Sport: if want to do something smart with sport,
+# then probably need to do it here
+#
+# Music: much the same, process, but uses M
+#
+# S	enable distinct sports category selection
+# SALL	all sports as seperate categories.
+# SLIVE	move live sports into sports-live category
+#
+# other	selectors mostly self explainitory, see below.
+#
+# Will need to fine tune selectors when have more data.
+#
+# Users will need to call category_editor with options like:
+#	--select=SALL
+#	--select=S,ST
+#	--select=S,SC,SM,SLIVE
+# or some relevant combination, can even be combined with Z1, and maybe Z4
+#
+# Change category seperator from , to = to protect from # multi category cull below.
+#L#LALL# s/,/=/g			if m/^lifestyle,/
+#M#MALL# s/,/=/g			if m/^music,/
+#S#SALL# s/,/=/g			if m/^sport,/
+
+# Cull multi categories, possibly non sport, back to the base category,
+# and discard the rest.
+s/,.*//
+
+# sport: various selections follow
+
+#SC#	s/=(cricket)/-$1/
+#SLC#	s/^sport-cricket/$&-live/	if $isLive
+
+#S#SALL# s/^extreme/sport=$&/
+s/^extreme/sport/
+
+#SFA#	s/=(afl)/-$1/
+#SFL#	s/=nrl/-league/
+#SFL#	s/=rubgy.(league)/-$1/
+#SFR#	s/=(rubgy).union/-$1/
+#SFR#	s/=(rubgy)/-$1/
+#SFS#	s/=(soccer)/-$1/
+
+#SM#	s/=(motorsport)/-$1/
+# #SM#	s/=(motocross)/-motorsport/ # is motocross a motorsport?
+
+#ST#	s/=(tennis)/-$1/
+
+#MLIVE#	s/^music=.*/music-live/		if $isLive
+#SLIVE#	s/^sport=.*/sport-live/		if $isLive
+
+#MALL#	s/^(music)=/$1-/g	# Select all music as distinct categories.
+#SALL#	s/^(sport)=/$1-/g	# Select all sport as distinct categories.
+
+#MCO#	s/=(classical.opera)/-$1/
+#MCY#	s/=(country)/-$1/
+#MDA#	s/=(dance)/-$1/
+#MJB#	s/=(jazz.blues)/-$1/
+#MPO#	s/=(pop)/-$1/
+#MRH#	s/=(rap.hip.hop)/-$1/
+#MRO#	s/=(rock)/-$1/
+
+#M#S#	s/=.*//			# Cull remaining music/sport to generic.
+
+#M#MALL# s/^music-/Music-/	# Protect music from selectors Z*.
+#S#SALL# s/^sport-/Sport-/	# protect sport from selectors Z*.
+
+s/^(action)..*/$1/
+s/^adventure.*/action/
+
+s/^animated/animation/
+s/^animation.*/animation/
+# Categorise daytime animation as children unless long.
+s/^animation/children/			if $start_time >= '0500' and $start_time <= '1850' and $length < 70
+s/^education.*/children/
+s/^children.?s/children/
+s/^kids/children/
+#Z1#Z4#	s/children/zchildren/
+
+s/.*culture$/arts/	# also people and culture or society and culture
+s/^art$/arts/
+#Z1#Z4#	s/^arts.*/zarts/
+
+# Do I want #C types to differentiate?
+s/^(crime)..*/$1/
+s/^mystery.*/crime/
+s/^.*/crime/				if $title =~ m/^(CSI:|Dalziel.*Pascoe|Law.*Order|NCIS)/
+s/^.*/crime/				if $title =~ m/^(Dalziel.*Pascoe)/
+
+#Z#Z1#Z4#	s/celebrity/z$&/
+
+s/comedies/comedy/
+s/^romantic.(comedy)/$1/
+s/^sitcom/comedy/
+s/^situation/comedy/
+
+# Do I want #D types to differentiate?
+s/.*/documentary/			if $title =~ /^Time Team/
+s/^making.of.*/documentary/
+#D#Z#Z1#Z4#	s/^biography/documentary/
+s/^historical.*/history/
+#D#Z#Z1#Z4#	s/^history/documentary/
+#D#Z#Z1#Z4#	s/^nature/documentary/
+s/^science.?nature.*/science/
+#D#Z#Z1#Z4#	s/^science$/documentary/	# Leave science fiction alone for now.
+s/^documentar..+/documentary/
+
+s/.*(drama).*/$1/
+s/^musical$/drama/	# Musical before music below since music is a submatch.
+m/^short$/				1				$isMovie++;
+s/^short$/drama/
+
+#Z1#Z4#	s/^entertainment/z$&/
+
+#Z#Z1#Z4#	s/^game.show/z$&/
+
+#Z#Z1#Z4#	s/^travel/lifestyle/
+#Z1#Z4#		s/^lifestyle/z$&/
+
+# Deal with music similar to sport.
+#Z1#Z4#		s/^music$/z$&/
+#M#MALL#	s/^Music/music/	# Protect music from selectors Z*.
+#MZ#		s/^music$/z$&/		# Zrate base music category, music-.* unchanged.
+
+# Do I want #N types to differentiate?
+s/^(news)..*/$1/
+#N#Z#Z1#Z4#	s/^business.*/news/
+#N#Z#Z1#Z4#	s/^current.affairs/news/
+#Z1#Z4#		s/^news/znews/
+
+s/^sci-fi.*/sci-fi/		# Strip possible fantasy
+s/^science.fiction.*/sci-fi/	# Strip possible fantasy
+s/^scifi.*/sci-fi/		# Strip possible fantasy
+s/^fantasy.*/sci-fi/		# Reclassify.
+s/^horror.*/sci-fi/		# Reclassify.
+s/.*/sci-fi/				if $title eq "Doctor Who"
+s/.*/sci-fi/				if $title =~ m/^Doctor Who/ && $length > 20	# not Confidental Cutdown
+s/.*/sci-fi/				if $title =~ m/^Torchwood/  && $length > 20	# not Declassified
+
+# Myth sports mode requires cat0=DB/program.category_type=sports and 
+#	cat1=DB/program.category=what
+1					m/^sport/			$isSports++
+#Z1#Z4#		s/^sport$/z$&/
+#S#SALL#	s/^Sport/sport/	# Protect sport from selectors Z*.
+#SZ#		s/^sport$/z$&/		# Zrate base sport category, sport-.* unchanged.
+
+s/^(talk).+/$1/
+s/^talk/variety/
+
+# Myth movie mode
+1					m/^movie/			$isMovie++
+
+# map uninteresting categories into one at the bottom of the collation order.
+#Z4#		s/^zarts/zzz/
+#Z#Z1#Z4#	s/^zcelebrity/zzz/
+#Z4#		s/^zchildren/zzz/
+#Z#Z1#Z4#	s/^zgame.show/zzz/
+#Z#Z1#Z4#	s/^infotainment/zzz/
+#Z#Z1#Z4#	s/^zmusical/zzz/	# musical first since music is a submatch
+#Z4#		s/^zmusic/zzz/
+#Z1#Z4#	s/^reality/zzz/
+#Z#Z1#Z4#	s/^religion/zzz/
+#Z#Z1#Z4#	s/^romance/zzz/
+#Z#Z1#Z4#	s/^shopping/zzz/
+#Z#Z1#Z4#	s/^soap/zzz/
+#Z4#		s/^zsport$/zzz/
+#Z#Z1#Z4#	s/^ztalk.show/zzz/
+#Z#Z1#Z4#	s/^unknown/zzz/
+#Z#Z1#Z4#	s/^variety/zzz/
+#Z#Z1#Z4#	s/^weather/zzz/
+
+# Leave as lower case, as simpler to deal with special myth categories
+# 	movie sports etc
+# 1					1				$_ = ucfirst $_
+EOD
+
+}
+
+
+
+#AFTER
+sub rules_after
+{
+	return << 'EOD';
+### INSERT RULES ABOVE HERE
+
+	}
+	continue	# Continue block required for #.*CHANGE# to "next"
+	{		# and still get stats generated for analysis.
+		my $n;
+		($n = $_) =~ s/ /_/g;		# replace space
+		$CE{stats}{$n}++;
+
+		hook "loop continue\n";
+
+		${$c}[0] = $_;
+		
+		print "=>$_" if $CE{debug};	# debug stage 1
+	}
+
+	hook "loop post\n";
+
+	# debug stage 2
+	if ($CE{debug})
+	{
+		print "  2";
+		for my $c (@{$p->{category}})
+		{
+			print ",${$c}[0]";
+		}
+	}
+
+	# mythtv movie mode requires cat0=DB/program.category_type=movie and
+	#	cat1=DB/program.category=what
+
+	# get cat 0 & 1 again
+	$category0	= $p->{category}[0][0];
+	$category1	= defined($p->{category}[1]) ? $p->{category}[1][0] : "";
+
+	# if cat0 was empty, and is it still empty, then delete temporary instance
+	if ($empty && $category0 eq "" && $#{$p->{category}} == 0) {
+		$p->{category} = [];
+	}
+
+	# isMovie and categories not setup correctly
+	$p->{category}[0][0] = $category0 = "movie" if $category0 eq "movies";
+	$p->{category}[1][0] = $category1 = "movie" if $category1 eq "movies";
+	if ($isMovie && $category1 !~ /^movie/i)
+	{
+		hook "movie";
+		$p->{category}[1][0] = $category1 = "drama"
+			if $category1 eq "";
+
+		# Swap category 0 & 1
+		if  ($category0 =~ /^movie/i)
+		{
+			my $tmp = $p->{category}[0];
+			$p->{category}[0] = $p->{category}[1];
+			$p->{category}[1] = $tmp;
+			print " swap=movie" if $CE{debug};
+		}
+		# Add Movie
+		else
+		{
+			push(@{$p->{category}}, [ 'movie' ]);
+			print " +movie" if $CE{debug};
+			$CE{stats}{"movie"}++;
+		}
+		$category0 = $p->{category}[0][0];
+		$category1 = $p->{category}[1][0];
+	}
+
+	# isSports and categories not setup correctly
+	$p->{category}[0][0] = $category0 = "sport" if defined($category0) && $category0 eq "sports";
+	if ($isSports && $category1 ne "sports")
+	{
+		hook "sports";
+		$p->{category}[1][0] = $category1 = "sports"
+			if $category1 eq "";
+
+		# Swap category 0 & 1
+		if  ($category0 eq "sports")
+		{
+			my $tmp = $p->{category}[0];
+			$p->{category}[0] = $p->{category}[1];
+			$p->{category}[1] = $tmp;
+			print " swap=sports" if $CE{debug};
+		}
+		# Add Sports
+		else
+		{
+			push(@{$p->{category}}, [ 'sports' ]);
+			print " +sports" if $CE{debug};
+			$CE{stats}{"sports"}++;
+		}
+		$category0 = $p->{category}[0][0];
+		$category1 = $p->{category}[1][0];
+	}
+
+	### should do also for series & tvshow maybe?
+
+	# These tags not used by mythtv, especially not in this postition,
+	# but may be useful to something else.  Will get a second copy if
+	# they are already present.
+	if ($isFinal) {
+		push(@{$p->{category}}, [ 'final' ]);
+		print " +final" if $CE{debug};
+		$CE{stats}{"final"}++;
+	}
+
+	if ($isLive) {
+		push(@{$p->{category}}, [ 'live' ]);
+		print " +live" if $CE{debug};
+		$CE{stats}{"live"}++;
+	}
+
+	if ($isPremiere) {
+		push(@{$p->{category}}, [ 'premiere' ]);
+		print " +premiere" if $CE{debug};
+		$CE{stats}{"premiere"}++;
+	}
+
+	# debug stage 3
+	if ($CE{debug})
+	{
+		print "  3";
+		for my $c (@{$p->{category}})
+		{
+			print ",${$c}[0]";
+		}
+		print "\n";
+	}
+
+	hook "end";
+	$CE{writer}->write_programme($p) if $CE{writer};
+}
+EOD
+
+}
